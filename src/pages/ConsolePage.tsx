@@ -10,9 +10,10 @@
  */
 const LOCAL_RELAY_SERVER_URL: string =
   process.env.REACT_APP_LOCAL_RELAY_SERVER_URL || '';
-
+const API_KEY = process.env.OPENAI_API_KEY || '';
 import { useEffect, useRef, useCallback, useState } from 'react';
-
+import {Modal} from '../components/Modal';
+import { CopyToClipboard } from 'react-copy-to-clipboard';
 import { RealtimeClient } from '@openai/realtime-api-beta';
 import { ItemType } from '@openai/realtime-api-beta/dist/lib/client.js';
 import { WavRecorder, WavStreamPlayer } from '../lib/wavtools/index.js';
@@ -124,6 +125,19 @@ export function ConsolePage() {
     lng: -122.418137,
   });
   const [marker, setMarker] = useState<Coordinates | null>(null);
+
+  // Add these new state variables
+  const [generatedImage, setGeneratedImage] = useState<string | null>(null);
+  const [isGeneratingImage, setIsGeneratingImage] = useState(false);
+
+  // Add these state variables
+  const [isGeneratingCode, setIsGeneratingCode] = useState(false);
+  const [generatedCode, setGeneratedCode] = useState('');
+  const [showCodeModal, setShowCodeModal] = useState(false);
+  const codeStreamRef = useRef<string>('');
+
+  // Add this state at the top of your component
+  const [showWeatherMap, setShowWeatherMap] = useState(false);
 
   /**
    * Utility for formatting the timing of logs
@@ -436,22 +450,183 @@ export function ConsolePage() {
         },
       },
       async ({ lat, lng, location }: { [key: string]: any }) => {
-        setMarker({ lat, lng, location });
-        setCoords({ lat, lng, location });
-        const result = await fetch(
-          `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,wind_speed_10m`
-        );
-        const json = await result.json();
-        const temperature = {
-          value: json.current.temperature_2m as number,
-          units: json.current_units.temperature_2m as string,
-        };
-        const wind_speed = {
-          value: json.current.wind_speed_10m as number,
-          units: json.current_units.wind_speed_10m as string,
-        };
-        setMarker({ lat, lng, location, temperature, wind_speed });
-        return json;
+        try {
+          setMarker({ lat, lng, location });
+          setCoords({ lat, lng, location });
+          
+          const result = await fetch(
+            `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,wind_speed_10m`
+          );
+          
+          if (!result.ok) {
+            throw new Error(`HTTP error! status: ${result.status}`);
+          }
+          
+          const json = await result.json();
+          const temperature = {
+            value: json.current.temperature_2m as number,
+            units: json.current_units.temperature_2m as string,
+          };
+          const wind_speed = {
+            value: json.current.wind_speed_10m as number,
+            units: json.current_units.wind_speed_10m as string,
+          };
+          
+          setMarker({ lat, lng, location, temperature, wind_speed });
+          return json;
+        } catch (error) {
+          console.error('Error fetching weather data:', error);
+          return { error: 'Failed to fetch weather data' };
+        } finally {
+          setShowWeatherMap(true);
+          setGeneratedImage(null);
+          setIsGeneratingImage(false);
+        }
+      }
+    );
+    client.addTool(
+      {
+        name: 'generate_image',
+        description: 'Generates an image based on the given prompt.',
+        parameters: {
+          type: 'object',
+          properties: {
+            prompt: {
+              type: 'string',
+              description: 'The description of the image to generate.',
+            },
+          },
+          required: ['prompt'],
+        },
+      },
+      async ({ prompt }: { prompt: string }) => {
+        setIsGeneratingImage(true);
+        setGeneratedImage(null);
+        try {
+          console.log(`Entered generate_image ${prompt} and key :${process.env.OPENAI_API_KEY}`);
+          
+          const response = await fetch('https://api.openai.com/v1/images/generations', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${API_KEY}`,
+            },
+            body: JSON.stringify({
+              prompt: prompt,
+              n: 1,
+              size: "256x256",
+            }),
+          });
+
+          if (!response.ok) {
+            throw new Error('Image generation failed');
+          }
+
+          const data = await response.json();
+          setGeneratedImage(data.data[0].url);
+          return { success: true, message: 'Image generated successfully' };
+        } catch (error) {
+          console.error('Error generating image:', error);
+          setGeneratedImage(null);
+          return { success: false, message: 'Failed to generate image' };
+        } finally {
+          setIsGeneratingImage(false);
+        }
+      }
+    );
+
+    async function* generateCode({ problem_statement, language }: { problem_statement: string; language: string }) {
+      setIsGeneratingCode(true);
+      setGeneratedCode('');
+      codeStreamRef.current = '';
+      setShowCodeModal(true);
+
+      try {
+        const response = await fetch('https://api.openai.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: 'gpt-3.5-turbo',
+            messages: [
+              { role: 'system', content: `You are a code generator. Generate ${language} code for the following problem statement.` },
+              { role: 'user', content: problem_statement }
+            ],
+            stream: true,
+          }),
+        });
+
+        if (!response.ok) {
+          throw new Error('Code generation failed');
+        }
+
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+
+        while (true) {
+          const { done, value } = await reader!.read();
+          if (done) break;
+
+          const chunk = decoder.decode(value);
+          const lines = chunk.split('\n');
+          const parsedLines = lines
+            .map((line) => line.replace(/^data: /, '').trim())
+            .filter((line) => line !== '' && line !== '[DONE]')
+            .map((line) => JSON.parse(line));
+
+          for (const parsedLine of parsedLines) {
+            const { choices } = parsedLine;
+            const { delta } = choices[0];
+            const { content } = delta;
+            if (content) {
+              codeStreamRef.current += content;
+              setGeneratedCode(codeStreamRef.current);
+              yield content; // Yield each new piece of content
+            }
+          }
+        }
+
+        return { success: true, message: 'Code generated successfully' };
+      } catch (error) {
+        console.error('Error generating code:', error);
+        setGeneratedCode('Failed to generate code');
+        return { success: false, message: 'Failed to generate code' };
+      } finally {
+        setIsGeneratingCode(false);
+      }
+    }
+
+    // Modify the tool definition to use the generator function
+    client.addTool(
+      {
+        name: 'generate_code',
+        description: 'Generates code based on the given problem statement or use case.',
+        parameters: {
+          type: 'object',
+          properties: {
+            problem_statement: {
+              type: 'string',
+              description: 'The problem statement or use case for which to generate code.',
+            },
+            language: {
+              type: 'string',
+              description: 'The programming language to use for code generation.',
+            },
+          },
+          required: ['problem_statement', 'language'],
+        },
+      },
+      async ({ problem_statement, language }: { problem_statement: string; language: string }) => {
+        let fullCode = '';
+        for await (const codeChunk of generateCode({ problem_statement, language })) {
+          fullCode += codeChunk;
+          // You can send incremental updates here if needed
+          // For example, you could emit an event or update state
+          // client.emit('code_update', { code: fullCode });
+        }
+        return { success: true, message: 'Code generated successfully', code: fullCode };
       }
     );
 
@@ -498,7 +673,7 @@ export function ConsolePage() {
       // cleanup; resets to defaults
       client.reset();
     };
-  }, []);
+  }, [API_KEY]);
 
   /**
    * Render the application
@@ -692,32 +867,75 @@ export function ConsolePage() {
           </div>
         </div>
         <div className="content-right">
-          <div className="content-block map">
-            <div className="content-block-title">get_weather()</div>
-            <div className="content-block-title bottom">
-              {marker?.location || 'not yet retrieved'}
-              {!!marker?.temperature && (
-                <>
-                  <br />
-                  🌡️ {marker.temperature.value} {marker.temperature.units}
-                </>
-              )}
-              {!!marker?.wind_speed && (
-                <>
-                  {' '}
-                  🍃 {marker.wind_speed.value} {marker.wind_speed.units}
-                </>
-              )}
+          {showWeatherMap ? (
+            <div className="content-block map">
+              <div className="content-block-title">get_weather()</div>
+              <div className="content-block-title bottom">
+                {marker?.location || 'not yet retrieved'}
+                {!!marker?.temperature && (
+                  <>
+                    <br />
+                    🌡️ {marker.temperature.value} {marker.temperature.units}
+                  </>
+                )}
+                {!!marker?.wind_speed && (
+                  <>
+                    {' '}
+                    🍃 {marker.wind_speed.value} {marker.wind_speed.units}
+                  </>
+                )}
+              </div>
+              <div className="content-block-body full">
+                {coords && (
+                  <Map
+                    center={[coords.lat, coords.lng]}
+                    location={coords.location}
+                  />
+                )}
+              </div>
             </div>
-            <div className="content-block-body full">
-              {coords && (
-                <Map
-                  center={[coords.lat, coords.lng]}
-                  location={coords.location}
-                />
-              )}
+          ) : generatedImage ? (
+            <div className="content-block image">
+              <div className="content-block-title">Generated Image</div>
+              <div className="content-block-body full">
+                <img src={generatedImage} alt="Generated image" style={{ width: '100%', height: 'auto' }} />
+              </div>
             </div>
-          </div>
+          ) : isGeneratingImage ? (
+            <div className="content-block loading">
+              <div className="content-block-title">Generating Image...</div>
+              <div className="content-block-body full">
+                <div className="loader"></div>
+              </div>
+            </div>
+          ) : (
+            <div className="content-block map">
+              <div className="content-block-title">get_weather()</div>
+              <div className="content-block-title bottom">
+                {marker?.location || 'not yet retrieved'}
+                {!!marker?.temperature && (
+                  <>
+                    <br />
+                    🌡️ {marker.temperature.value} {marker.temperature.units}
+                  </>
+                )}
+                {!!marker?.wind_speed && (
+                  <>
+                    {' '}
+                    🍃 {marker.wind_speed.value} {marker.wind_speed.units}
+                  </>
+                )}
+              </div>
+              <div className="content-block-body full">
+                {coords && (
+                  <Map
+                    center={[coords.lat, coords.lng]}
+                    location={coords.location}
+                  />
+                )}
+              </div>
+            </div>
+          )}
           <div className="content-block kv">
             <div className="content-block-title">set_memory()</div>
             <div className="content-block-body content-kv">
@@ -726,6 +944,15 @@ export function ConsolePage() {
           </div>
         </div>
       </div>
+      <Modal isOpen={showCodeModal} onClose={() => setShowCodeModal(false)}>
+        <h2>Generated Code</h2>
+        <div className="code-container">
+          <pre>{generatedCode}</pre>
+        </div>
+        <CopyToClipboard text={generatedCode}>
+          <button className="copy-button">Copy Code</button>
+        </CopyToClipboard>
+      </Modal>
     </div>
   );
 }
